@@ -1,0 +1,166 @@
+name: Docker Build alpine-jdk8 New
+
+on:
+  workflow_dispatch:
+
+env:
+  image: alpine-jdk8
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+    name: Docker Build
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/checkout@v3
+      with:
+        repository: asaifee02/docker-sbom-composite
+        ref: main
+        token: '${{ secrets.PAT_TOKEN }}'
+        path: .github/actions/
+
+    - name: Dockerfile Scan
+      id: docker-file-scan
+      uses: ./.github/actions/dockerfile-scan
+      with: 
+        dockerfile-path: ./${{ env.image }}/Dockerfile 
+
+    - name: Cache docker image
+      id: cache
+      uses: actions/cache@v3
+      env:
+        cache-name: docker-images-cache
+      with:
+        path: ~/${{ env.image }}.tar
+        key: ${{ env.image }}_${{ github.run_number }}
+
+    - name: Docker Build 
+      id: docker-build
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: ./.github/actions/docker-build
+      with: 
+        name: 'asaifee02'
+        version: ${{ github.run_number }}
+        source: 'asaifee02'
+        summary: 'Hello World'
+        team: 'asaifee02'
+        author: 'asaifee02'
+        image-tag: "${{ env.image }}:${{ github.run_number }}"
+        dockerfile-path: ./${{ env.image }}/Dockerfile
+
+    - name: Docker Save
+      id: docker-save
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: docker save -o ~/${{ env.image }}.tar ${{ env.image }}:${{ github.run_number }}
+
+  SBOM-Generation-And-Scan:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/checkout@v3
+      with:
+        repository: asaifee02/docker-sbom-composite
+        ref: main
+        token: '${{ secrets.PAT_TOKEN }}'
+        path: .github/actions/
+
+    - name: Import image
+      id: fetch-image
+      uses: actions/cache@v3
+      with:
+        path: ~/${{ env.image }}.tar
+        key: ${{ env.image }}_${{ github.run_number }}
+
+    - if: ${{ steps.fetch-image.outputs.cache-hit == 'true' }}
+      run: docker import ~/${{ env.image }}.tar ${{ env.image }}:${{ github.run_number }}
+
+    - name: SBOM Generation
+      id: docker-sbom
+      uses: ./.github/actions/docker-sbom-generation
+      with: 
+        image-tag: "${{ env.image }}:${{ github.run_number }}"
+        sbom-file: "${{ env.image }}_${{ github.run_number }}.sbom.json"
+
+    - name: Grype Scan
+      id: docker-grype
+      uses: ./.github/actions/docker-grype
+      with:
+        image-tag: "${{ env.image }}:${{ github.run_number }}"
+        sbom-file: "${{ env.image }}_${{ github.run_number }}.sbom.json"
+        grype-file: "${{ env.image }}_${{ github.run_number }}_grype-report.json"
+
+    - uses: actions/upload-artifact@v3
+      with:
+        name: "${{ env.image }}_${{ github.run_number }}.sbom.json"
+        path: "${{ env.image }}_${{ github.run_number }}.sbom.json"
+
+    - uses: actions/upload-artifact@v3
+      with:
+        name: "${{ env.image }}_${{ github.run_number }}_grype-report.json"
+        path: "${{ env.image }}_${{ github.run_number }}_grype-report.json"
+
+  DockerPush:
+    runs-on: ubuntu-latest
+    needs: SBOM-Generation-And-Scan
+    outputs:
+      digest: ${{ steps.docker-push.outputs.digest }}
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/checkout@v3
+      with:
+        repository: asaifee02/docker-sbom-composite
+        ref: main
+        token: '${{ secrets.PAT_TOKEN }}'
+        path: .github/actions/
+
+    - name: Import image
+      id: fetch-image
+      uses: actions/cache@v3
+      with:
+        path: ~/${{ env.image }}.tar
+        key: ${{ env.image }}_${{ github.run_number }}
+
+    - if: ${{ steps.fetch-image.outputs.cache-hit == 'true' }}
+      run: docker import ~/${{ env.image }}.tar ${{ env.image }}:${{ github.run_number }}
+
+    - name: Docker Push
+      id: docker-push
+      uses: ./.github/actions/docker-push
+      with: 
+        username: _json_key 
+        password: ${{ secrets.GCR_SECRETS_KEY }}
+        registry: gcr.io
+        image-tag: "${{ env.image }}:${{ github.run_number }}"
+
+  SignImage-and-AttachAttestation:
+    runs-on: ubuntu-latest
+    needs: DockerPush
+    permissions:
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        repository: asaifee02/docker-sbom-composite
+        ref: main
+        token: '${{ secrets.PAT_TOKEN }}'
+        path: .github/actions/
+
+    - uses: actions/download-artifact@v3
+      with:
+        name: "${{ env.image }}_${{ github.run_number }}.sbom.json"
+
+    - name: Sign image and attach its SBOM
+      id: docker-sign-sbom-attach
+      uses: ./.github/actions/docker-sign-sbom-attach
+      with:
+        username: _json_key 
+        password: ${{ secrets.GCR_SECRETS_KEY }}
+        registry: gcr.io
+        image-tag: "${{ env.image }}@${{ needs.DockerPush.outputs.digest }}"
+        cosign-version: '2.0.0'
+        sbom-file: "${{ env.image }}_${{ github.run_number }}.sbom.json"
